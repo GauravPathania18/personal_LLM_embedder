@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager  # For FastAPI lifespan context
 
 # ----------------- THIRD-PARTY LIBRARIES -----------------
 from fastapi import FastAPI, HTTPException  # Web framework and exception handling
-from pydantic import BaseModel, model_validator  # Data validation for request/response models
+from pydantic import BaseModel, field_validator, model_validator  # Data validation for request/response models
 from bs4 import BeautifulSoup  # HTML parsing and stripping
 import numpy as np  # Numerical operations
 
@@ -31,10 +31,15 @@ except ImportError:
 EMBEDDING_MODE = os.getenv("EMBEDDING_MODE", "local")  # "local" / "openai" / "gemini"
 LOCAL_MODEL = os.getenv("LOCAL_MODEL", "all-mpnet-base-v2")  # Default local model
 DEVICE = os.getenv("DEVICE", "cpu")  # "cpu" or "cuda" (GPU)
-HTML_STRIP = os.getenv("HTML_STRIP", "true").lower() == "true"  # Whether to strip HTML from text
+HTML_STRIP = HTML_STRIP = os.getenv("HTML_STRIP", "true").strip().lower() in ("1", "true", "yes")
+ # Whether to strip HTML from text
 
 # Global variable to hold the loaded embedding model
 _model: Optional[SentenceTransformer] = None
+
+# Precompiled regex for simple HTML tag detection (fast path)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"\s+")
 
 # ----------------- FASTAPI APP WITH LIFESPAN -----------------
 @asynccontextmanager
@@ -67,6 +72,24 @@ class EmbedRequest(BaseModel):
     texts: Optional[List[str]] = None
     source: str = "user_prompt"
 
+
+    # ---- Field-level cleaning : trim strings early ----
+    @field_validator("text")
+    @classmethod
+    def _trim_text(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return v.strip()
+
+    @field_validator("texts")
+    @classmethod
+    def _trim_texts(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        if v is None:
+            return v
+        # Trim each string if not None; filter out accidental empties? (we'll keep as-is)
+        return [s.strip() if isinstance(s, str) else s for s in v]
+    
+    # ---- Model-level rule: enforce exactly one of text/texts ----
     @model_validator(mode="after")
     def check_one_of(self):
         """
@@ -99,22 +122,29 @@ class EmbedBatchResponse(BaseModel):
     items: List[EmbedResponseItem]
 
 # ----------------- HELPER FUNCTIONS -----------------
-_whitespace = re.compile(r"\s+")
 
-def _strip_html(s: str) -> str:
+
+def _strip_html_if_present(s: str) -> str:
     """
-    Remove HTML tags from a string using BeautifulSoup if HTML_STRIP is True.
+    Strip HTML only if:
+      1) HTML_STRIP is enabled AND
+      2) The input likely contains HTML tags (regex detection)
     """
     if not HTML_STRIP:
         return s
-    return BeautifulSoup(s, "html.parser").get_text(" ")
+    if not s:
+        return s
+    # Fast-path check: only call BeautifulSoup if tags are found
+    if _HTML_TAG_RE.search(s):
+        return BeautifulSoup(s, "html.parser").get_text(" ")
+    return s
 
 def _clean(s: str) -> str:
     """
     Clean text by stripping HTML and normalizing whitespace.
     """
-    s = _strip_html(s)
-    return _whitespace.sub(" ", s.strip())
+    s = _strip_html_if_present(s)
+    return _WHITESPACE_RE.sub(" ", s.strip())
 
 def _ensure_list(req: EmbedRequest) -> List[str]:
     """
@@ -137,6 +167,9 @@ def _embed_local(texts: List[str]) -> List[List[float]]:
     """
     Generate embeddings using a local SentenceTransformer model.
     """
+    if _model is None:
+        raise HTTPException(status_code=500, detail="Embedding model not loaded.")
+    # Batch encode; convert_to_numpy gives np.float32 -> cast to Python list
     raw_vectors = _model.encode(texts, convert_to_numpy=True)
     return _ensure_python_list(raw_vectors)
 
@@ -147,7 +180,7 @@ def _embed(texts: List[str]) -> List[List[float]]:
     """
     if EMBEDDING_MODE == "local":
         return _embed_local(texts)
-    raise HTTPException(status_code=500, detail=f"Unknown EMBEDDING_MODE: {EMBEDDING_MODE}")
+    raise HTTPException(status_code=501, detail=f"Unknown EMBEDDING_MODE: {EMBEDDING_MODE}")
 
 # ----------------- ROUTES -----------------
 @app.get("/")
@@ -170,8 +203,8 @@ def embed(req: EmbedRequest):
     Generate embeddings for single or multiple texts.
     Returns embedding vectors with metadata and processing time.
     """
-    raw_texts = _ensure_list(req)
-    cleaned_texts = [_clean(x) for x in raw_texts]
+    raw_texts: List[str]= _ensure_list(req)
+    cleaned_texts: List[str]= [_clean(x) for x in raw_texts]
 
     # Check if any text is empty after cleaning
     if any(len(c) == 0 for c in cleaned_texts):
