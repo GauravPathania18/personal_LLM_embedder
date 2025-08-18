@@ -31,7 +31,7 @@ except ImportError:
 EMBEDDING_MODE = os.getenv("EMBEDDING_MODE", "local")  # "local" / "openai" / "gemini"
 LOCAL_MODEL = os.getenv("LOCAL_MODEL", "all-mpnet-base-v2")  # Default local model
 DEVICE = os.getenv("DEVICE", "cpu")  # "cpu" or "cuda" (GPU)
-HTML_STRIP = HTML_STRIP = os.getenv("HTML_STRIP", "true").strip().lower() in ("1", "true", "yes")
+HTML_STRIP = os.getenv("HTML_STRIP", "true").strip().lower() in ("1", "true", "yes")
  # Whether to strip HTML from text
 
 # Global variable to hold the loaded embedding model
@@ -68,37 +68,32 @@ class EmbedRequest(BaseModel):
     Request schema for embedding endpoint.
     Accepts either a single text or a list of texts.
     """
-    text: Optional[str] = None
+    
     texts: Optional[List[str]] = None
     source: str = "user_prompt"
 
 
     # ---- Field-level cleaning : trim strings early ----
-    @field_validator("text")
+    @field_validator("texts", mode="before")
     @classmethod
-    def _trim_text(cls, v: Optional[str]) -> Optional[str]:
-        if v is None:
-            return v
-        return v.strip()
-
-    @field_validator("texts")
-    @classmethod
-    def _trim_texts(cls, v: Optional[List[str]]) -> Optional[List[str]]:
-        if v is None:
-            return v
-        # Trim each string if not None; filter out accidental empties? (we'll keep as-is)
-        return [s.strip() if isinstance(s, str) else s for s in v]
+    def ensure_list_and_trim(cls, v):
+        # Case 1: single string → wrap into list
+        if isinstance(v, str):
+            return [v.strip()]
+        # Case 2: list of strings → trim each
+        if isinstance(v, list):
+            return [s.strip() for s in v if isinstance(s, str)]
+        # Invalid input
+        raise ValueError("texts must be a string or list of strings")
     
     # ---- Model-level rule: enforce exactly one of text/texts ----
     @model_validator(mode="after")
-    def check_one_of(self):
+    def check_texts_not_empty(self):
         """
-        Ensure only one of `text` or `texts` is provided, not both.
+        Ensure `texts` exists and has at least one non-empty string.
         """
-        if not self.text and not self.texts:
-            raise ValueError("Provide either 'text' (str) or 'texts' (list[str]).")
-        if self.text and self.texts:
-            raise ValueError("Provide only one of 'text' or 'texts', not both.")
+        if not self.texts or all(len(s) == 0 for s in self.texts):
+            raise ValueError("At least one non-empty string is required in 'texts'.")
         return self
 
 class EmbedResponseItem(BaseModel):
@@ -150,7 +145,7 @@ def _ensure_list(req: EmbedRequest) -> List[str]:
     """
     Convert request input into a list of strings.
     """
-    return [req.text] if req.text is not None else (req.texts or [])
+    return  req.texts or []
 
 def _ensure_python_list(vectors):
     """
@@ -171,7 +166,12 @@ def _embed_local(texts: List[str]) -> List[List[float]]:
         raise HTTPException(status_code=500, detail="Embedding model not loaded.")
     # Batch encode; convert_to_numpy gives np.float32 -> cast to Python list
     raw_vectors = _model.encode(texts, convert_to_numpy=True)
-    return _ensure_python_list(raw_vectors)
+    vectors=_ensure_python_list(raw_vectors)
+
+    # Debug log
+    print(f"[Embedding] Generated {len(texts)} embeddings, dim={len(vectors[0])}")
+
+    return vectors
 
 def _embed(texts: List[str]) -> List[List[float]]:
     """
@@ -200,15 +200,14 @@ def health():
 @app.post("/embed", response_model=EmbedBatchResponse)
 def embed(req: EmbedRequest):
     """
-    Generate embeddings for single or multiple texts.
+    Generate embeddings for one or multiple texts.
     Returns embedding vectors with metadata and processing time.
     """
-    raw_texts: List[str]= _ensure_list(req)
-    cleaned_texts: List[str]= [_clean(x) for x in raw_texts]
+    raw_texts: List[str] = _ensure_list(req)
+    cleaned_texts: List[str] = [_clean(x) for x in raw_texts if len(x.strip()) > 0]
 
-    # Check if any text is empty after cleaning
-    if any(len(c) == 0 for c in cleaned_texts):
-        raise HTTPException(status_code=400, detail="One or more inputs are empty after cleaning.")
+    if not cleaned_texts:
+        raise HTTPException(status_code=400, detail="All inputs are empty after cleaning.")
 
     # Generate embeddings and measure processing time
     t0 = time.time()
